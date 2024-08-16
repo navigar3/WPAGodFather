@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Generated with glade 3.40.0 -->
+<interface>
+  <requires lib="gtk+" version="3.24"/>
+  <object class="GtkStatusIcon" id="WPASysTrayIcon">
+    <property name="pixbuf">../icons/network-connect.png</property>
+    <property name="has-tooltip">True</property>
+    <property name="tooltip-text" translatable="yes">WPA GodFather</property>
+    <signal name="activate" handler="show_MainWin" swapped="no"/>
+    <signal name="popup-menu" handler="show_MainMenu" swapped="no"/>
+  </object>
+</interface>
