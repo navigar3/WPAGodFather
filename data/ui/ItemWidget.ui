@@ -78,14 +78,26 @@
       </packing>
     </child>
     <child>
-      <object class="GtkImage" id="NetSecurityIcon">
-        <property name="width-request">30</property>
+      <object class="GtkBox">
+        <property name="width-request">40</property>
         <property name="visible">True</property>
         <property name="can-focus">False</property>
-        <property name="margin-left">14</property>
-        <property name="margin-right">11</property>
-        <property name="icon-name">security-high</property>
-        <property name="icon_size">5</property>
+        <property name="homogeneous">True</property>
+        <child>
+          <object class="GtkImage" id="NetSecurityIcon">
+            <property name="width-request">30</property>
+            <property name="can-focus">False</property>
+            <property name="margin-left">14</property>
+            <property name="margin-right">11</property>
+            <property name="icon-name">security-high</property>
+            <property name="icon_size">5</property>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="position">0</property>
+          </packing>
+        </child>
       </object>
       <packing>
         <property name="expand">False</property>
@@ -94,13 +106,25 @@
       </packing>
     </child>
     <child>
-      <object class="GtkImage" id="NetKnown">
+      <object class="GtkBox">
+        <property name="width-request">30</property>
         <property name="visible">True</property>
         <property name="can-focus">False</property>
-        <property name="margin-left">15</property>
-        <property name="margin-right">13</property>
-        <property name="icon-name">emblem-favorite</property>
-        <property name="icon_size">5</property>
+        <property name="homogeneous">True</property>
+        <child>
+          <object class="GtkImage" id="NetKnownIcon">
+            <property name="can-focus">False</property>
+            <property name="margin-left">15</property>
+            <property name="margin-right">13</property>
+            <property name="icon-name">emblem-favorite</property>
+            <property name="icon_size">5</property>
+          </object>
+          <packing>
+            <property name="expand">False</property>
+            <property name="fill">True</property>
+            <property name="position">0</property>
+          </packing>
+        </child>
       </object>
       <packing>
         <property name="expand">False</property>

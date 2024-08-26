@@ -912,7 +912,8 @@ class wpa_cli_manager:
         self.log.log(' GOT ADDR %s, renewal %s' % (addr, renewal))
 
         self.sel_timeout = None
-        self.target['step_ok'] = True
+        if self.target:
+          self.target['step_ok'] = True
         self.next_target_step()
 
 
