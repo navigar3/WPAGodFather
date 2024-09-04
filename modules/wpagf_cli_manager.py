@@ -14,6 +14,169 @@ import socket
 
 from wpagf_logger import LOGLEVEL, wlogger
 
+class tgt_node:
+  def __init__(self,
+               current_status,
+               onsuccess=None,
+               onsuccess_exec=None,
+               onfail=None,
+               onfail_exec=None,
+               params=None):
+    self.current_status = current_status
+    self.onsuccess = onsuccess
+    self.onsuccess_exec = onsuccess_exec
+    self.onfail = onfail
+    self.onfail_exec = onfail_exec
+    self.params = params
+
+  def get_param(self, param_name):
+    if self.params:
+      if param_name in self.params:
+        return self.params[param_name]
+
+
+class tgt:
+  def __init__(self, targetname=None,
+               by=None, gparams={}):
+    self.targetname = targetname
+    self.by = by
+    self.nodes = {}
+    self.cnode = None
+    self.gparams = gparams
+
+    self.log = wlogger('WPACLI.Target')
+
+    self.cnode_success = False
+    self.status_params = []
+    self.tgt_error = False
+
+  def set_name(self, name, by=None):
+    self.targetname = name
+    self.by = by
+
+  def start(self):
+    self.log.log('Starting target %s by %s' % \
+      (self.targetname, self.by))
+
+  def set_gparam(self, gparam_name, gparam):
+    if not gparam_name in self.gparams:
+      self.gparams[gparam_name] = gparam
+
+  def get_gparam(self, gparam_name):
+    if self.gparams:
+      if gparam_name in self.gparams:
+        return self.gparams[gparam_name]
+
+  def set_status_params(self, status_params):
+    self.status_params.append(status_params)
+
+  def get_status_params(self):
+    if len(self.status_params) > 0:
+      return self.status_params.pop(0)
+    else:
+      return ()
+
+  def set_cnode_success(self, success):
+    if self.targetname:
+      self.cnode_success = success
+
+  def add_node(self, nodename,
+               current_status,
+               onsuccess=None,
+               onsuccess_exec=None,
+               onfail=None,
+               onfail_exec=None,
+               params=None):
+
+    # Nodename must NOT be already declared
+    if nodename in self.nodes:
+      self.log.log('Error while adding TARGET Node: Node %s already present!' % nodename)
+      self.tgt_error = True
+      return False
+
+    # Add node
+    self.nodes[nodename] = tgt_node(current_status,
+                                    onsuccess,
+                                    onsuccess_exec,
+                                    onfail,
+                                    onfail_exec,
+                                    params)
+
+    # Set entrypoint now if not already set
+    if self.cnode is None:
+      self.cnode = nodename
+
+  def get_cnode_params(self, p):
+    return self.nodes[self.cnode].get_param(p)
+
+  def make_cmd_line(self, clist, cmd_params):
+    lclist = len(clist)
+    ccmd = ''
+    for el in range(0, lclist):
+      if type(clist[el]) == str:
+        ccmd += clist[el]
+      else:
+        ccmd += cmd_params[clist[el]]
+      if el < lclist - 1:
+        ccmd += ' '
+
+    self.log.log(' ===========', lev=7)
+    self.log.log(' =========== ccmd is %s.' % ccmd, lev=7)
+
+    return ccmd
+
+  def pre_exec_cmd_line(self):
+    pre_exec = None
+    if self.cnode_success:
+      pre_exec = self.nodes[self.cnode].onsuccess_exec
+    else:
+      pre_exec = self.nodes[self.cnode].onfail_exec
+
+    if pre_exec:
+      return self.make_cmd_line(pre_exec, self.get_status_params())
+    else:
+      return None
+
+  def next_node(self):
+    if self.targetname is None:
+      return {'status': 'idle'}
+
+    if self.tgt_error:
+      return {'status': 'fail', 'opt': 'error'}
+
+    if self.cnode_success:
+      self.cnode = self.nodes[self.cnode].onsuccess
+    else:
+      self.cnode = self.nodes[self.cnode].onfail
+
+    current_status = self.nodes[self.cnode].current_status
+    ans = {'fsm_status': current_status}
+
+    self.log.log('New node: %s, new status: %s' % \
+      (self.cnode, current_status), lev=8)
+
+    if self.cnode == 'end':
+      self.log.log('Target reached!', lev=8)
+      ans['status'] = 'success'
+      self.flush_target()
+    else:
+      ans['status'] = 'running'
+
+    return ans
+
+
+  def flush_target(self):
+    self.targetname = None
+    self.nodes = {}
+    self.cnode = None
+    self.gparams = {}
+
+    self.cnode_success = False
+    self.status_params = []
+    self.tgt_error = False
+
+
+
 
 class wpa_cli_manager:
   def __init__(self,
@@ -57,10 +220,7 @@ class wpa_cli_manager:
                      'scan_end': None,
                      'request_from': None,
                      'results': None}
-    self.target = {'name': None,
-                   'issued_by': None,
-                   'path': {},
-                   'def_fallback': None}
+    self.target = tgt()
     self.current_op = {'name': None,
                        'running': None,
                        'cli_cmd': None,
@@ -68,7 +228,6 @@ class wpa_cli_manager:
                        'end_time': None,
                        'status': None,
                        'result': None}
-    self._connet_attempt = None
 
     self.ifd = None
     self.ofd = None
@@ -76,6 +235,10 @@ class wpa_cli_manager:
     self.rls = []  # wpa_cli raw output lines
     self.ols = []  # wpa_cli command output lines
     self.els = []  # wpa_cli events output lines
+
+    self.ipp = None # Ip subprocess handler
+    self.ipod = None # Ip stdout pipe file handler
+    self.iped = None # Ip stderr pipe file handler
 
     self.dp = None # Dhclient subprocess handler
     self.dfd = None # Dhclient pipe file descriptor
@@ -86,6 +249,8 @@ class wpa_cli_manager:
     self.add_handler(self.evfdmaster_h, b'master_evfd')
     self.add_handler(self.wpa_cli_stdout_h, b'wpa_cli_stdout')
     self.add_handler(self.dhclient_h, b'dhclient_stdout')
+    self.add_handler(self.ip_stdout_h, b'ip_stdout')
+    self.add_handler(self.ip_stderr_h, b'ip_stderr')
     
     self.log = wlogger('WPACLI')
     
@@ -96,101 +261,7 @@ class wpa_cli_manager:
   def add_handler(self, handler, handler_name):
     self.handlers[handler_name] = handler
 
-  def add_target(self, name, by=None, def_fallback=None):
-    self.target = {'name': name,
-                   'issued_by': by,
-                   'def_fallback': def_fallback,
-                   'curr_step': None,
-                   'step_ok': False,
-                   'step_ans': {},
-                   'path': {}}
-
-  def set_target(self, stepname, curr_status,
-                 onsuccess=None, onfail=None,
-                 params=None, fallback=None):
-
-    if self.target['curr_step'] is None:
-      self.target['curr_step'] = stepname
-
-    step = {}
-    step['status'] = curr_status
-    step['onsuccess'] = {'land_step': None}
-    step['onfail'] = None
-    step['status'] = curr_status
-    step['params'] = params
-
-    if stepname != 'end':
-      step['onsuccess']['land_step'] = onsuccess['land']
-
-      if 'extra' in onsuccess:
-        step['onsuccess']['extra'] = onsuccess['extra']
-
-    if onfail:
-      step['onfail'] = {'land_step': None}
-      step['onfail']['land_step'] = onfail['land']
-      if 'extra' in onfail:
-        step['onfail']['extra'] = onfail['extra']
-
-    self.target['path'][stepname] = step
-
-
-  def next_target_step(self):
-
-    step = self.target['path'][self.target['curr_step']]
-
-    if self.target['step_ok']:
-      tgt = 'onsuccess'
-    else:
-      tgt = 'onfail'
-
-    # Set step_ok to default value
-    self.target['step_ok'] = False
-
-    if tgt in step:
-      if 'extra' in step[tgt]:
-        if 'clicmd' in step[tgt]['extra']:
-          clist = step[tgt]['extra']['clicmd']
-          ccmd = ''
-          lclist = len(clist)
-          for el in range(0, lclist):
-            if type(clist[el]) == str:
-              ccmd += clist[el]
-            else:
-              ccmd += self.target['step_ans'][clist[el]]
-            if el < lclist - 1:
-              ccmd += ' '
-
-          self.log.log(' ===========', lev=7)
-          self.log.log(' =========== ccmd is %s.' % ccmd, lev=7)
-
-          self.submit_cmd(ccmd)
-
-      curr_step = step[tgt]
-      self.target['curr_step'] = curr_step['land_step']
-
-      # Set New FSM Status
-      self.status = self.target['path'][self.target['curr_step']]['status']
-
-    else:
-      # Fallback
-      self.fallback()
-      return
-
-    self.log.log(' [TARGET] New step: %s, new status: %s' % \
-      (self.target['curr_step'], self.status), lev=8)
-
-    # Target reach!
-    if self.target['curr_step'] == 'end':
-      self.target = None
-      self.busy = False
-      qans = {'action': 'READY'}
-      self.send_to_main(qans)
-      if self.is_master_attached:
-        self.send_to_master(qans)
-      self.log.log(' [TARGET] Target reached!', lev=8)
-
-
-  def start_target(self, curr_status, cmd):
+  def run_target(self, init_status, init_cmd=None):
     # Tell main and master I'm busy
     qans = {'action': 'BUSY'}
     self.send_to_main(qans)
@@ -198,19 +269,28 @@ class wpa_cli_manager:
       self.send_to_master(qans)
 
     self.busy = True
-    self.status = curr_status
-    self.submit_cmd(cmd)
+    self.status = init_status
+    if init_cmd:
+      self.submit_cmd(init_cmd)
+    self.target.start()
 
-  def del_target(self):
-    self.target = None
+  def next_target_node(self):
+    pre_exec_cmd_line = self.target.pre_exec_cmd_line()
+    if pre_exec_cmd_line:
+      self.submit_cmd(pre_exec_cmd_line)
 
-    # Reget inet status
-    self.add_target('GET_INET_STATUS', by=None)
-    self.set_target('parse_inet_st',
-                    'PARSE_INET_STATUS',
-                    {'land': 'end'})
-    self.set_target('end', 'IDLE')
-    self.start_target('PARSE_INET_STATUS', 'status')
+    status = self.target.next_node()
+    if status['status'] == 'idle':
+      self.log.log('Target is not set.')
+    elif status['status'] == 'running':
+      self.status = status['fsm_status']
+    elif status['status'] == 'success':
+      self.status = status['fsm_status']
+      self.busy = False
+      qans = {'action': 'READY'}
+      self.send_to_main(qans)
+      if self.is_master_attached:
+        self.send_to_master(qans)
 
   def send_to_main(self, data):
     self._qtomain.put_nowait(data)
@@ -230,10 +310,10 @@ class wpa_cli_manager:
 
     # If dt is 1 quit.
     if dt & 0x0f:
-      self.status = 'TERMINATED'
       self.log.log('Got Termination Event from MAIN.')
-      self.terminate_wpa_cli()
-      return False
+      self.log.log('Terminating...')
+      #self.submit_cmd('quit')
+      return True
 
     elif dt & 0xf0:
       # Message in queue from MAIN
@@ -292,37 +372,34 @@ class wpa_cli_manager:
           self.scan_res['request_from'] = 'MASTER'
           self.scan_res['results'] = None
 
-          self.add_target('SCAN', by='MASTER')
-          self.set_target('do_scan',
-                          'SCAN',
-                          {'land': 'scanning'})
-          self.set_target('scanning', 'SCANNING',
-                          {'land': 'get_scan_res',
-                           'extra': {'clicmd': ('scan_result', )}})
-          self.set_target('get_scan_res', 'GET_SCAN_RESULT',
-                          {'land': 'get_status',
-                           'extra': {'clicmd': ('status', )}})
-          self.set_target('get_status',
-                          'PARSE_INET_STATUS',
-                          {'land': 'end'})
-          self.set_target('end', 'IDLE')
+          self.target.set_name('SCAN', 'MASTER')
+          self.target.add_node('do_scan', 'SCAN',
+                               onsuccess='scanning')
+          self.target.add_node('scanning', 'SCANNING',
+                               onsuccess='get_scan_res',
+                               onsuccess_exec=('scan_result', ))
+          self.target.add_node('get_scan_res', 'GET_SCAN_RESULT',
+                               onsuccess='get_status',
+                               onsuccess_exec=('status', ))
+          self.target.add_node('get_status', 'PARSE_INET_STATUS',
+                               onsuccess='end')
+          self.target.add_node('end', 'IDLE')
 
-          #print(' ========= target:', self.target)
-
-          self.start_target('SCAN', 'scan')
+          self.run_target('SCAN', 'scan')
 
         # Connect Request
         elif qi['action'] == 'MAS_CONNECT':
+          connect_attempt = {'assoc': {},
+                             'net_details': qi['data']
+                            }
 
-          self._connet_attempt = {'assoc': {},
-                                  'net_details': qi['data']
-                                 }
+          bssid = connect_attempt['net_details']['BSSID']
 
           # Is network protected with psk?
           use_psk = False
-          if 'PSK' in self._connet_attempt['net_details']:
+          if 'PSK' in connect_attempt['net_details']:
 
-            hpsk = self._connet_attempt['net_details']['PSK']
+            hpsk = connect_attempt['net_details']['PSK']
             spsk = ''
             for i in range(0,int(len(hpsk)/2)):
               spsk += chr(int(hpsk[2*i:2*i+2], base=16))
@@ -330,82 +407,77 @@ class wpa_cli_manager:
             if not spsk.isalnum():
               self.log.log(' !!!!')
               self.log.log(' !!!! Not Printable PSK! !!!!')
-              self._connet_attempt = None
               return True
 
-            self._connet_attempt['net_details']['SPSK'] = '"' + spsk + '"'
+            connect_attempt['net_details']['SPSK'] = '"' + spsk + '"'
 
-            land_des = {'land': 'set_psk',
-                        'extra': {'clicmd': ('set_network', 0, 'psk', 1)}}
+            setup_net = 'set_psk'
+            setup_net_exec = ('set_network', 0, 'psk', 1)
+
             use_psk = True
           else:
             # Disable key management
             land_des = {'land': 'end'} # TO BE IMPLEMENTED
 
-          self.add_target('CONNECT', by='MASTER')
+          self.target.set_name('CONNECT', 'MASTER')
+          self.target.set_gparam('connect_attempt', connect_attempt)
 
-          self.set_target('disconnect',
-                          'CONFIG_SETUP',
-                          {'land': 'get_inet_st',
-                           'extra': {'clicmd': ('status', )}})
-          self.set_target('get_inet_st',
-                          'PARSE_INET_STATUS',
-                          {'land': 'list_network',
-                           'extra': {'clicmd': ('list_network', )}})
-          self.set_target('list_network', 'LIST_NETWORK',
-                          land_des,
-                          {'land': 'add_network',
-                           'extra': {'clicmd': ('add_network', )}},
-                          params={'sbssid': True, 'use_psk': use_psk})
-          self.set_target('add_network',
-                          'CONNECT_ADD_NETWORK',
-                          {'land': 'set_bssid',
-                           'extra': {'clicmd': ('set_network', 0, 'bssid', 1)}})
-          self.set_target('set_bssid',
-                          'CONFIG_SETUP',
-                          {'land': 'list_network',
-                           'extra': {'clicmd': ('list_network', )}})
-          self.set_target('set_psk',
-                          'CONFIG_SETUP',
-                          {'land': 'select_net',
-                           'extra': {'clicmd': ('select_network', 0)}},
-                          params={'copy_net_num': True})
-          self.set_target('select_net',
-                          'CONFIG_SETUP',
-                          {'land': 'reconnect',
-                           'extra': {'clicmd': ('reconnect', )}})
-          self.set_target('reconnect',
-                          'CONFIG_SETUP',
-                          {'land': 'associating'},
-                          params={'associating': True})
-          self.set_target('associating',
-                          'VALIDATING',
-                          {'land': 'assoc_success',
-                           'extra': {'clicmd': ('status', )}},
-                          {'land': 'assoc_failed',
-                           'extra': {'clicmd': ('disconnect', )}})
-          self.set_target('assoc_success',
-                          'PARSE_INET_STATUS',
-                          {'land': 'get_addr'},
-                          params={'run_dhcp': True})
-          self.set_target('get_addr',
-                          'GETTING_DHCP_ADDR',
-                          {'land': 'got_addr',
-                           'extra': {'clicmd': ('status', )}},
-                          {'land': 'assoc_failed',
-                           'extra': {'clicmd': ('disconnect', )}})
-          self.set_target('got_addr',
-                          'PARSE_INET_STATUS',
-                          {'land': 'end'})
-          self.set_target('assoc_failed',
-                          'CONFIG_SETUP',
-                          {'land': 'assoc_failed_status',
-                           'extra': {'clicmd': ('status', )}},
-                          params={'fail_connect_report': True})
-          self.set_target('assoc_failed_status',
-                          'PARSE_INET_STATUS',
-                          {'land': 'end'})
-          self.set_target('end', 'IDLE')
+
+          self.target.add_node('disconnect', 'CONFIG_SETUP',
+                               onsuccess='get_inet_st',
+                               onsuccess_exec=('status', ),
+                               params={'run_ip_cmds': True,
+                                       'ip_cmds': ['flush', 'down', 'up']})
+          self.target.add_node('get_inet_st', 'PARSE_INET_STATUS',
+                               onsuccess='list_network',
+                               onsuccess_exec=('list_network', ))
+          self.target.add_node('list_network', 'LIST_NETWORK',
+                               onsuccess=setup_net,
+                               onsuccess_exec=setup_net_exec,
+                               onfail='add_network',
+                               onfail_exec=('add_network', ),
+                               params={'sbssid': True,
+                                       'bssid': bssid,
+                                       'use_psk': use_psk})
+          self.target.add_node('add_network', 'CONNECT_ADD_NETWORK',
+                               onsuccess='set_bssid',
+                               onsuccess_exec=('set_network', 0, 'bssid', 1))
+          self.target.add_node('set_bssid', 'CONFIG_SETUP',
+                               onsuccess='list_network',
+                               onsuccess_exec=('list_network', ))
+          self.target.add_node('set_psk', 'CONFIG_SETUP',
+                               onsuccess='select_net',
+                               onsuccess_exec=('select_network', 0),
+                               params={'copy_net_num': True})
+          self.target.add_node('select_net', 'CONFIG_SETUP',
+                               onsuccess='reconnect',
+                               onsuccess_exec=('reconnect', ))
+          self.target.add_node('reconnect', 'CONFIG_SETUP',
+                               onsuccess='associating',
+                               params={'associating': True})
+          self.target.add_node('associating', 'VALIDATING',
+                               onsuccess='assoc_success',
+                               onsuccess_exec=('status', ),
+                               onfail='assoc_failed',
+                               onfail_exec=('disconnect', ))
+          self.target.add_node('assoc_success', 'PARSE_INET_STATUS',
+                               onsuccess='get_addr',
+                               params={'run_dhcp': True})
+          self.target.add_node('get_addr', 'GETTING_DHCP_ADDR',
+                               onsuccess='got_addr',
+                               onsuccess_exec=('status', ),
+                               onfail='assoc_failed',
+                               onfail_exec=('disconnect', ))
+          self.target.add_node('got_addr', 'PARSE_INET_STATUS',
+                               onsuccess='end')
+          self.target.add_node('assoc_failed', 'CONFIG_SETUP',
+                               onsuccess='assoc_failed_status',
+                               onsuccess_exec=('status', ),
+                               params={'fail_connect_report': True})
+          self.target.add_node('assoc_failed_status',
+                               'PARSE_INET_STATUS',
+                               onsuccess='end')
+          self.target.add_node('end', 'IDLE')
 
           qans = {'action': 'ASSOCIATING'}
           self.send_to_master(qans)
@@ -415,7 +487,7 @@ class wpa_cli_manager:
           if self.dp:
             self.terminate_dhclient()
 
-          self.start_target('CONFIG_SETUP', 'disconnect')
+          self.run_target('CONFIG_SETUP', 'disconnect')
 
         else:
           self.log.log('Unknown request! Discarded.')
@@ -458,19 +530,16 @@ class wpa_cli_manager:
 
     self.log.log('  !!!!!! Fallback !!!!')
 
-    self.del_target()
+    self.target.flush_target()
 
+    self.target.set_name('GET_INET_STATUS')
+    self.target.add_node('parse_inet_st',
+                          'PARSE_INET_STATUS',
+                          onsuccess='end')
+    self.target.add_node('end', 'IDLE')
 
-  def check_command(self, cmd):
-    if cmd + '\n' == self.current_op['cli_cmd'].decode():
-      return True
-    return False
+    self.run_target('PARSE_INET_STATUS', 'status')
 
-  # Check for prompt at the end of lines.
-  def check_prompt(self, l):
-    if l[-3:] == b'\n> ':
-      return True
-    return False
 
   # Handle wpa_cli stdout
   def wpa_cli_stdout_h(self, mask, key):
@@ -482,6 +551,11 @@ class wpa_cli_manager:
     self.log.log('stdout is filled', lev=8)
     wout = os.read(self.ofd, 1024)
     self.log.log('stdout ::-> %s' % wout, lev=8)
+
+    if wout == b'\r\x1b[K':
+      self.log.log('That\'s all folks!')
+      self.status = 'TERMINATED'
+      return False
 
     try:
       self.rls += wout.decode().split('\n')
@@ -535,12 +609,11 @@ class wpa_cli_manager:
           if self.status != 'IDLE':
             self.fallback()
           else:
-            self.add_target('GET_INET_STATUS', by=None)
-            self.set_target('parse_inet_st',
-                            'PARSE_INET_STATUS',
-                            {'land': 'end'})
-            self.set_target('end', 'IDLE')
-            self.start_target('PARSE_INET_STATUS', 'status')
+            self.target.set_name('GET_INET_STATUS', None)
+            self.target.add_node('parse_inet_st', 'PARSE_INET_STATUS',
+                                 onsuccess='end')
+            self.target.add_node('end', 'IDLE')
+            self.run_target('PARSE_INET_STATUS', 'status')
 
       # Handle CONNECT Event
       if re.search('CTRL-EVENT-CONNECTED', wcli_ev):
@@ -548,16 +621,15 @@ class wpa_cli_manager:
           self.log.log(' ---->>>>>>>>> VALIDATE SUCCESS <<<<<<<<<<-------')
 
           self.sel_timeout = None
-          self.target['step_ok'] = True
-          self.next_target_step()
+          self.target.set_cnode_success(True)
+          self.next_target_node()
 
         if self.status == 'IDLE':
-          self.add_target('GET_INET_STATUS', by=None)
-          self.set_target('parse_inet_st',
-                          'PARSE_INET_STATUS',
-                          {'land': 'end'})
-          self.set_target('end', 'IDLE')
-          self.start_target('PARSE_INET_STATUS', 'status')
+          self.target.set_name('GET_INET_STATUS', None)
+          self.target.add_node('parse_inet_st', 'PARSE_INET_STATUS',
+                               onsuccess='end')
+          self.target.add_node('end', 'IDLE')
+          self.run_target('PARSE_INET_STATUS', 'status')
 
     if not with_prompt:
       self.log.log('   >>>>>>> Waiting for prompt...', lev=10)
@@ -583,13 +655,13 @@ class wpa_cli_manager:
 
         self.ols = []
 
-        self.add_target('GET_INET_STATUS', by=None)
-        self.set_target('parse_inet_st',
-                        'PARSE_INET_STATUS',
-                        {'land': 'end'})
-        self.set_target('end', 'IDLE')
+        self.target.set_name('GET_INET_STATUS')
+        self.target.add_node('parse_inet_st',
+                             'PARSE_INET_STATUS',
+                             onsuccess='end')
+        self.target.add_node('end', 'IDLE')
 
-        self.start_target('PARSE_INET_STATUS', 'status')
+        self.run_target('PARSE_INET_STATUS', 'status')
 
         return True
 
@@ -604,15 +676,6 @@ class wpa_cli_manager:
     elif self.status == 'PARSE_INET_STATUS':
       self.ols.pop(0)
 
-      run_dhcp = False
-      if self.target:
-        curr_step = self.target['path'][self.target['curr_step']]
-        if 'params' in curr_step:
-          if curr_step['params']:
-            if 'run_dhcp' in curr_step['params']:
-              if curr_step['params']['run_dhcp'] is True:
-                run_dhcp = True
-
       # Try to parse output
       try:
         parsed = self.ols
@@ -623,7 +686,6 @@ class wpa_cli_manager:
       except:
         self.log.log('Unexpected ISSUE_GET_INET_STATUS answer!')
         self.ols = []
-        self.target['def_fallback']()
         return True
 
       # Check for all keys presence
@@ -637,14 +699,14 @@ class wpa_cli_manager:
           return True
 
       # All ok!
-      self.target['step_ok'] = True
+      self.target.set_cnode_success(True)
 
       # Clean output
       self.ols = []
 
       # Check if inet status has changed
       if not self.inetstatus == pairs:
-        self.log.log(" @@@@ STATUS has changed @@@@ ")
+        self.log.log(" @@@@ INET STATUS has changed @@@@ ")
         self.inetstatus = pairs
         print(self.inetstatus)
 
@@ -655,14 +717,14 @@ class wpa_cli_manager:
         if self.is_master_attached:
           self.send_to_master(qans)
 
-      if run_dhcp:
+      if self.target.get_cnode_params('run_dhcp'):
         # Launch dhclient
         self.sel_timeout = self.dhcp_timeout
-        self._connet_attempt['dhcp_start'] = time.time_ns()
+        self.target.set_gparam('dhcp_start', time.time_ns())
         self.run_dhclient()
 
       # Set NEW state.
-      self.next_target_step()
+      self.next_target_node()
 
       return True
 
@@ -673,8 +735,8 @@ class wpa_cli_manager:
 
       if self.ols.pop(0) == 'OK':
 
-        self.target['step_ok'] = True
-        self.next_target_step()
+        self.target.set_cnode_success(True)
+        self.next_target_node()
 
         self.sel_timeout = self.scan_timeout
         self.log.log(' ^^^^^^ Scanning for Networks... ^^^^^^')
@@ -682,7 +744,8 @@ class wpa_cli_manager:
         # Warn Main Thread
         qreq = {'action': 'SCANNING', 'data': self.scan_res}
         self.send_to_main(qreq)
-        self.send_to_master(qreq)
+        if self.is_master_attached:
+          self.send_to_master(qreq)
 
         return True
 
@@ -710,9 +773,7 @@ class wpa_cli_manager:
         self.fallback()
         return True
 
-      self.target['step_ok'] = True
-
-      self.busy = False
+      self.target.set_cnode_success(True)
 
       self.ols = []
 
@@ -729,7 +790,7 @@ class wpa_cli_manager:
 
       self.send_to_main(qreq)
 
-      self.next_target_step()
+      self.next_target_node()
 
       return True
     ### Scan section ends
@@ -738,30 +799,31 @@ class wpa_cli_manager:
     elif self.status == 'CONFIG_SETUP':
       self.ols.pop(0)
 
-      if self.target:
-        curr_step = self.target['path'][self.target['curr_step']]
-        if 'params' in curr_step:
-          if curr_step['params']:
-            if 'copy_net_num' in curr_step['params']:
-              if curr_step['params']['copy_net_num'] is True:
-                self.target['step_ans'] = \
-                  [str(self._connet_attempt['assoc']['netnum']), ]
-            if 'associating' in curr_step['params']:
-              if curr_step['params']['associating'] is True:
-                self._connet_attempt['assoc_start'] = time.time_ns()
-                self.sel_timeout = self.assoc_timeout
-            if 'fail_connect_report' in curr_step['params']:
-              if curr_step['params']['fail_connect_report'] is True:
-                qans = {'action': 'CONNECTION_FAILED', 'data': 'CONN_FAILED'}
-                self.send_to_main(qans)
-                if self.is_master_attached:
-                  self.send_to_master(qans)
+      if self.target.get_cnode_params('associating'):
+        self.target.set_gparam('assoc_start', time.time_ns())
+        self.sel_timeout = self.assoc_timeout
+
+      if self.target.get_cnode_params('fail_connect_report'):
+        qans = {'action': 'CONNECTION_FAILED', 'data': 'CONN_FAILED'}
+        self.send_to_main(qans)
+        if self.is_master_attached:
+          self.send_to_master(qans)
+
+      if self.target.get_cnode_params('copy_net_num'):
+        self.target.set_status_params(["%d" % \
+          self.target.get_gparam('assoc_net_num'), ])
 
       ans = self.ols.pop(0)
 
+      if self.target.get_cnode_params('run_ip_cmds'):
+        ip_cmds = self.target.get_cnode_params('ip_cmds')
+        for c in ip_cmds:
+          if self.run_ip_cmd(c) is False:
+            self.fallback()
+
       if ans == 'OK':
-        self.target['step_ok'] = True
-        self.next_target_step()
+        self.target.set_cnode_success(True)
+        self.next_target_node()
         return True
       else:
         self.log.log('Unexpected answer from wpa_cli!')
@@ -789,39 +851,25 @@ class wpa_cli_manager:
 
       self.net_list = nlist
 
-      self.target['step_ok'] = True
-
-      curr_step = self.target['path'][self.target['curr_step']]
-      search_bssid = False
-      use_psk = False
-
-      if 'params' in curr_step:
-        if 'sbssid' in curr_step['params']:
-          if curr_step['params']['sbssid'] is True:
-            search_bssid = True
-        if 'use_psk' in curr_step['params']:
-          if curr_step['params']['use_psk'] is True:
-            use_psk = True
-
-      if search_bssid:
-        s_bssid = self._connet_attempt['net_details']['BSSID']
-        if s_bssid in self.net_list:
-          self.target['step_ans'] = [self.net_list[s_bssid][0], ]
-          if use_psk:
-            self.target['step_ans'].append(
-              self._connet_attempt['net_details']['SPSK'])
-          self._connet_attempt['assoc']['netnum'] = \
-            int(self.net_list[s_bssid][0])
-          self.target['step_ok'] = True
-          self.log.log(';;;;;;;;;;;; IS in list: netnum %d ' % \
-            self._connet_attempt['assoc']['netnum'], lev=9)
+      if self.target.get_cnode_params('sbssid'):
+        s_bssid = self.target.get_cnode_params('bssid')
+        if s_bssid in nlist:
+          self.target.set_gparam('assoc_net_num', int(nlist[s_bssid][0]))
+          self.log.log(';;;;;;;;;;;; IS in list: netnum %s ' % \
+            nlist[s_bssid][0], lev=9)
+          if self.target.get_cnode_params('use_psk'):
+            self.target.set_status_params(
+              [nlist[s_bssid][0],
+               self.target.get_gparam('connect_attempt')['net_details']['SPSK']])
+          else:
+            self.target.set_status_params([nlist[s_bssid][0], ])
+          self.target.set_cnode_success(True)
         else:
-          self.target['step_ok'] = False
           self.log.log(';;;;;;;;;;;; is NOT in list', lev=9)
+          self.target.set_cnode_success(False)
 
 
-      self.next_target_step()
-      self.busy = False
+      self.next_target_node()
 
       return True
 
@@ -839,12 +887,12 @@ class wpa_cli_manager:
         return True
 
       if not assoc_net_num is None:
-        self._connet_attempt['assoc']['netnum'] = assoc_net_num
-        self.target['step_ok'] = True
-        self.target['step_ans'] = \
+        self.target.set_gparam('assoc_net_num', assoc_net_num)
+        self.target.set_cnode_success(True)
+        self.target.set_status_params(
           ['%d' % assoc_net_num,
-           self._connet_attempt['net_details']['BSSID']]
-        self.next_target_step()
+           self.target.get_gparam('connect_attempt')['net_details']['BSSID']])
+        self.next_target_node()
       else:
         self.log.log('Cannot parse wpa_cli answer!')
         self.fallback()
@@ -860,6 +908,108 @@ class wpa_cli_manager:
     self.log.log('This should not happen!')
 
     return False
+
+
+  def run_ip_cmd(self, action=None, iface='wlan0'):
+    if not action:
+      return True
+
+    expect_output = False
+    expect_error = False
+
+    if action == 'down':
+      cmd_args = ['ip', 'link', 'set', 'dev', iface, 'down']
+    elif action == 'up':
+      cmd_args = ['ip', 'link', 'set', 'dev', iface, 'up']
+    elif action == 'flush':
+      cmd_args = ['ip', 'addr', 'flush', 'dev', iface]
+
+    scmd = ''
+    for i in cmd_args:
+      scmd += i
+      scmd += ' '
+
+    self.log.log('Running %s' % scmd)
+
+    self.ipp = sp.Popen(cmd_args,
+                        stdout=sp.PIPE, stderr=sp.PIPE)
+
+    self.ipod = self.ipp.stdout.fileno()
+    self.iped = self.ipp.stderr.fileno()
+
+
+    exs = self.ipp.wait()
+    if exs == 0:
+      self.log.log('ip exits successfully.')
+      return True
+    else:
+      expect_error = True
+      self.log.log('ip exits with %d' % exs)
+
+    if expect_output:
+      self.sel.register(self.ipod, selectors.EVENT_READ,
+                        data=b'ip_stdout')
+    else:
+      os.close(self.ipod)
+
+    if expect_error:
+      if self.iped:
+        os.close(self.iped)
+        self.sel.unregister(self.iped)
+        self.iped = None
+
+      self.sel.register(self.iped, selectors.EVENT_READ,
+                        data=b'ip_stderr')
+    else:
+      os.close(self.iped)
+
+    return False
+
+
+  def ip_stdout_h(self, mask, key):
+    # Only read request could be handled
+    if not (mask & selectors.EVENT_READ):
+      return False
+
+    while True:
+      wout = os.read(self.ipod, 1024)
+
+      if wout == b'':
+        break
+
+      lws = wout.decode().split('\n')
+
+      for l in lws:
+        self.log.log(' (IP) %s' % l, lev=8)
+
+    os.close(self.ipod)
+    self.sel.unregister(self.ipod)
+    self.ipod = None
+
+    return True
+
+
+  def ip_stderr_h(self, mask, key):
+    # Only read request could be handled
+    if not (mask & selectors.EVENT_READ):
+      return False
+
+    while True:
+      wout = os.read(self.iped, 1024)
+
+      if wout == b'':
+        break
+
+      lws = wout.decode().split('\n')
+
+      for l in lws:
+        self.log.log(' (IP ERR) %s' % l, lev=8)
+
+    os.close(self.iped)
+    self.sel.unregister(self.iped)
+    self.iped = None
+
+    return True
 
 
   def run_dhclient(self, iface='wlan0'):
@@ -912,10 +1062,9 @@ class wpa_cli_manager:
         self.log.log(' GOT ADDR %s, renewal %s' % (addr, renewal))
 
         self.sel_timeout = None
-        if self.target:
-          self.target['step_ok'] = True
-        self.next_target_step()
 
+        self.target.set_cnode_success(True)
+        self.next_target_node()
 
     return True
 
@@ -932,8 +1081,8 @@ class wpa_cli_manager:
         self.busy = True
         self.sel_timeout = None
 
-        self.target['step_ok'] = True
-        self.next_target_step()
+        self.target.set_cnode_success(True)
+        self.next_target_node()
 
         return True
       else:
@@ -942,15 +1091,15 @@ class wpa_cli_manager:
 
     elif self.status == 'VALIDATING':
       delta_t = 1 + int((time.time_ns() - \
-        self._connet_attempt['assoc_start'])/1e9)
+        self.target.get_gparam('assoc_start')) / 1e9)
       self.log.log(' ............. Timeout = %d, delta_t = %d' % \
         (self.sel_timeout, delta_t))
       if delta_t >= self.assoc_timeout:
         self.log.log('Validating timeout has elapsed')
         self.sel_timeout = None
 
-        self.target['step_ok'] = False
-        self.next_target_step()
+        self.target.set_cnode_success(False)
+        self.next_target_node()
 
         return True
 
@@ -960,7 +1109,7 @@ class wpa_cli_manager:
 
     elif self.status == 'GETTING_DHCP_ADDR':
       delta_t = 1 + int((time.time_ns() - \
-        self._connet_attempt['dhcp_start'])/1e9)
+        self.target.get_gparam('dhcp_start')) / 1e9)
       self.log.log(' ............. Timeout = %d, delta_t = %d' % \
         (self.sel_timeout, delta_t))
       if delta_t >= self.dhcp_timeout:
@@ -1002,15 +1151,6 @@ class wpa_cli_manager:
   def terminate_wpa_cli(self):
     self.log.log('Terminating...')
     os.write(self.ifd, b'quit\n')
-    
-    exs = self.p.wait()
-    if exs == 0:
-      self.log.log('Terminated.')
-    else:
-      self.log.log('%s exits with %d!' % (self.prgname, exs))
-
-    self.status = 'TERMINATED'
-    #self.p.terminate()
                       
    
   def run(self):
@@ -1018,10 +1158,6 @@ class wpa_cli_manager:
     KEEP_RUNNING = True
      
     while KEEP_RUNNING:
-
-      if self.status == 'TERMINATE':
-        KEEP_RUNNING = False
-        break
 
       ev = self.sel.select(self.sel_timeout)
 
@@ -1037,6 +1173,10 @@ class wpa_cli_manager:
           if not self.handlers[key.data](mask, key.data):
             KEEP_RUNNING = False
 
-    if self.status != 'TERMINATED':
-      self.terminate_wpa_cli()
+    exs = self.p.wait()
+    if exs == 0:
+      self.log.log('Terminated.')
+    else:
+      self.log.log('%s exits with %d!' % (self.prgname, exs))
+
 

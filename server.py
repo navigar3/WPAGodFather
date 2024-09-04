@@ -323,10 +323,10 @@ def launch_server():
         th['th'].join()
 
       # Send termination event to wpa_cli_manager
-      mlog.log('Sending termination event to thread WPACLI...')
-      os.eventfd_write(clievfds[1], 0x01)
-      sel.unregister(clievfds[0])
+      mlog.log('Waiting thread WPACLI to complete...')
+      #os.eventfd_write(clievfds[1], 0x01)
       wpa_cli_thread.join()
+      sel.unregister(clievfds[0])
       
       # Terminate wpa_supplicant
       wpas.terminate()
