@@ -32,12 +32,26 @@ def launch_cli():
     sc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sc.bind(cli_sock_name)
 
-    print("Sending sock name %s ..." % cli_sock_name)
-    s.sendall(cli_sock_name.encode())
+    print("Sending username %s ..." % os.getlogin())
+    s.sendall(os.getlogin().encode())
 
-    sc.listen()
-    (c, a) = sc.accept()
-    print("--->", c)
+    hs_token = s.recv(1024)
+
+    s.sendall(b'GOON')
+
+    while True:
+      sc.listen()
+      (c, a) = sc.accept()
+      twin_token = c.recv(1024)
+
+      if twin_token == hs_token:
+        c.sendall(b'OK')
+        break
+
+      else:
+        sys.stderr.write("Handshake token mismatch!\n")
+        c.sendall(b'ERR_HS_TOKEN')
+        c.close()
 
     token = s.recv(1024)
     if token:

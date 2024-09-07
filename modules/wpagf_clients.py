@@ -105,10 +105,23 @@ class client_manager:
 
           return True
 
+        else:
+          # Request Status to main Thread.
+          self.send_to_main({'action': 'GET_STATUS'})
+
+          self.status = 'IDLE'
+
+          return True
+
       elif r == b'SCAN':
         if self.master:
           # Scan Request to cli Thread.
           self.send_to_cli({'action': 'MAS_SCAN'})
+          self.status = 'IDLE'
+          return True
+
+        else:
+          self.send_to_main({'action': 'SCAN'})
           self.status = 'IDLE'
           return True
 
@@ -125,7 +138,7 @@ class client_manager:
                ({'match': 'open$', 'next': 'IPMODE'},
                 {'match': 'psk$', 'next': 'PSK'}),
              'PSK':
-               ({'match': '([a-f0-9][a-f0-9]){2,256}$', 'next': 'IPMODE'}, ),
+               ({'match': '([a-f0-9][a-f0-9]){8,63}$', 'next': 'IPMODE'}, ),
              'IPMODE':
                ({'match': 'dhcp$', 'next': 'END'}, )
             }
@@ -231,6 +244,7 @@ class client_manager:
     elif dt & 0xf0:
       while not self._qfrommain.empty():
         qi = self._qfrommain.get()
+
         if qi['action'] == 'SET_MASTER':
           (self.clievfdr, self.clievfdw) = qi['data']['cli_evfd']
           (self._qfromcli, self._qtocli) = qi['data']['cli_queue']
@@ -245,6 +259,34 @@ class client_manager:
                                 'data': {'is_master': True}
                                }
                               )
+
+        elif qi['action'] == 'BUSY':
+          self.send_to_cclient({'msg':'BUSY'})
+
+        elif qi['action'] == 'READY':
+          self.send_to_cclient({'msg': 'READY'})
+
+        elif qi['action'] == 'UPDATE_INET_STATUS':
+          self.send_to_cclient({'msg': 'UPDATE_INET_STATUS',
+                                'data': qi['data']})
+
+        elif qi['action'] == 'GOT_INET_STATUS':
+          self.send_to_cclient({'msg': 'GOT_INET_STATUS',
+                                'data': qi['data']})
+
+        elif qi['action'] == 'SCANNING':
+          self.send_to_cclient({'msg': 'SCANNING'})
+
+        elif qi['action'] == 'SCAN_RESULTS':
+          self.send_to_cclient({'msg': 'SCAN_RESULTS',
+                                'data': qi['data']})
+
+        elif qi['action'] == 'CONNECTION_FAILED':
+          self.send_to_cclient({'msg': 'CONNECTION_FAILED',
+                                'data': qi['data']})
+
+        else:
+          self.log.log('Unknown action %s' % qi['action'])
 
       return True
 
@@ -308,7 +350,7 @@ class client_manager:
 
         ev = self.csel.select(timeout=None)
         # Debug
-        print (' **** [Thread %s]' % self.tname, ev)
+        #print (' **** [Thread %s]' % self.tname, ev)
 
         for key, mask in ev:
           if key.data in self.handlers:
@@ -340,7 +382,16 @@ class client_manager:
     self.log.log('Finish.')
 
 
+
+
 # handshake with new clients
+
+xdg_runtime_prefix = '/run/user/'
+xdg_runtime_path = {'fixed': xdg_runtime_prefix,
+                    'variable': 'uid'}
+
+import pwd
+
 class cli_handshake:
   def __init__(self, sock, data):
     self.sock = sock
@@ -354,7 +405,43 @@ class cli_handshake:
     self.sc = None
     self._con_open = True
     self.status = 'NEW'
+
+    self.client_sock_name = None
+    self.userid = None
     
+
+  def get_userid(self):
+    return self.userid
+
+  def sockname(self, username):
+    try:
+      uinfo = pwd.getpwnam(username)
+    except KeyError:
+      self.log.log('Unknown username!')
+      return False
+
+    scknampre = ''
+    path_error = False
+
+    for k, v in xdg_runtime_path.items():
+      if k == 'fixed':
+        scknampre += v
+      elif k == 'variable':
+        if v == 'uid':
+          scknampre += str(uinfo.pw_uid)
+        elif v == 'username':
+          scknampre += username
+        else:
+          path_error = True
+      else:
+        path_error = True
+
+    if path_error is True:
+      self.log.log('Error while building socket path!')
+      return False
+
+    return (uinfo.pw_uid, scknampre + '/wpagf.sock')
+
 
   def closecon(self):
     if self._con_open is True:
@@ -391,29 +478,72 @@ class cli_handshake:
           self.closecon()
           return False
 
-      # Status is GETSOCKNAME: get socket name, check if
-      #  socket is usable.
+      # Status is GETSOCKNAME: get socket name
       elif self.status == 'GETSOCKNAME':
-
-        handshake_success = False
         
-        client_sock_name = r.decode()
-        self.log.log('Received socket name %s' % client_sock_name)
+        try:
+          username = r.decode()
+        except:
+          self.log.log('Error while communicating with client!')
+          return False
+
+        ans = self.sockname(username)
+
+        if ans is False:
+          self.log.log('Bad socket name!')
+          self.closecon()
+          return False
+
+        (self.userid, self.client_sock_name) = ans
+
+        self.log.log('Socket name %s' % self.client_sock_name)
+
+        self.status = 'OK_GETSOCKNAME'
+        sel.modify(self.sock, selectors.EVENT_READ|selectors.EVENT_WRITE, data=self.k)
+
+        return self.userid
+
+
+      # Status is CHECKSOCKNAME: check if socket is usable.
+      elif self.status == 'CHECKSOCKNAME':
+
+        checksock_success = False
+
+        if r != b'GOON':
+          self.log.log('Bad protocol!')
+          return False
 
         try:
           # Try to connect with client managed socket.
 
           self.sc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-          self.sc.connect(client_sock_name)
+          self.sc.connect(self.client_sock_name)
 
-          handshake_success = True
+          #checksock_success = True
 
         except Exception as e:
           self.log.log("Error while opening socket %s due to %s" % \
-            (client_sock_name, e))
+            (self.client_sock_name, e))
           self.closecon()
 
-        if handshake_success is True:
+        try:
+          self.sc.sendall(self.hs_token)
+        except Exception as e:
+          self.log.log('Error while sending handshake token to client: %s' % e)
+          return False
+
+        try:
+          if self.sc.recv(1024) == b'OK':
+            checksock_success = True
+            self.log.log('Client socket handshake token validation is OK.')
+          else:
+            self.log.log('Client socket handshake token validation error.')
+            return False
+        except Exception as e:
+          self.log.log('Client socket validation error due to: %s' % e)
+          return False
+
+        if checksock_success is True:
           self.status = 'SUCCESS'
           sel.modify(self.sock, selectors.EVENT_READ|selectors.EVENT_WRITE, data=self.k)
           return True
@@ -450,6 +580,16 @@ class cli_handshake:
         if self._ws.write(b'OK'):
           sel.modify(self.sock, selectors.EVENT_READ, data=self.k)
           self.status = 'GETSOCKNAME'
+          return True
+
+        self.closecon()
+        return False
+
+      elif self.status == 'OK_GETSOCKNAME':
+        self.hs_token = str(time.time_ns())[-5:].encode()
+        if self._ws.write(self.hs_token):
+          sel.modify(self.sock, selectors.EVENT_READ, data=self.k)
+          self.status = 'CHECKSOCKNAME'
           return True
 
         self.closecon()

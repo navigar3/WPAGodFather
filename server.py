@@ -1,3 +1,6 @@
+#!/usr/bin/env /usr/bin/python3
+#-*- coding: utf-8 -*-
+
 import os
 import sys
 import time
@@ -22,15 +25,18 @@ from wpagf_clients import sel, cli_handshake, client_manager
 PIDFILE='/run/wpagf.pid'
 SOCKFILE='/run/wpagf.sock'
 
-WPAGF_GID=1236
-WPAGFMASTER_GID=1237
-
 
 ClientsNum = 0
 NewClients = {}
 
 CliMans = {}
 
+WPAGF_GNAME = 'wpagf'
+WPAGFMASTER_GNAME = 'wpagfmaster'
+WPAGFMASTER_MEMBERS = []
+WPAGF_GID = None
+
+import pwd, grp
 
 class wpa_supplicant_manager:
   def __init__(self,
@@ -65,9 +71,16 @@ class wpa_supplicant_manager:
     self.p.terminate()
 
 
+def send_to_thread(t, data):
+  t['Queue'][1].put_nowait(data)
+  os.eventfd_write(t['evfd'][1], 0x10)
+
+
 def launch_server():
 
   global ClientsNum
+  global WPAGF_GID
+  global WPAGFMASTER_MEMBERS
   
   mlog = wlogger('MAIN')
 
@@ -78,6 +91,23 @@ def launch_server():
     mlog.log("Pidfile %s exist! Please remove it before launching server"
              "Exiting..." % PIDFILE)
     sys.exit(1)
+
+  try:
+    wpagf_group = grp.getgrnam(WPAGF_GNAME)
+  except KeyError:
+    mlog.log('Group \'%s\' doesn\'t exist! Exiting...' % WPAGF_GNAME)
+    sys.exit(1)
+
+  WPAGF_GID = wpagf_group.gr_gid
+
+  try:
+    wpagfmaster_group = grp.getgrnam(WPAGFMASTER_GNAME)
+  except KeyError:
+    mlog.log('Group \'%s\' doesn\'t exist! Exiting...' % WPAGF_GNAME)
+    sys.exit(1)
+
+  for m in wpagfmaster_group.gr_mem:
+    WPAGFMASTER_MEMBERS.append(m)
 
   # Write PIDFILE
   try:
@@ -141,6 +171,7 @@ def launch_server():
 
   # Scanned networks
   scan_results = {}
+  scan_min_interval = 20
 
   # Master client?
   has_master = False
@@ -164,7 +195,7 @@ def launch_server():
     try:
       while True:
         ev = sel.select(timeout=None)
-        print (ev)
+        #print (ev)
 
         for key, mask in ev:
 
@@ -192,24 +223,48 @@ def launch_server():
             if key.data in NewClients:
               ans = NewClients[key.data].communicate(mask)
 
+              if ans is True:
+                pass
+
               # An error occurred in handshake: close connection and clean.
-              if not ans:
+              elif ans is False:
                 mlog.log('Removing client %s' % key.data)
                 NewClients[key.data].closecon()
-                del NewClients[key.data]
+                NewClients.pop(key.data)
+
+              # Check for userid
+              elif type(ans) == int:
+                if ans == 0:
+                  mlog.log('Cannot connect as root!')
+                  NewClients[key.data].closecon()
+                  NewClients.pop(key.data)
+
+                if ans in CliMans:
+                  mlog.log('Userid %d already present!' % ans)
+                  NewClients[key.data].closecon()
+                  NewClients.pop(key.data)
 
               # Handshake ends successfull: start new thread
               elif type(ans) == socket.socket:
 
+                cuserid = NewClients[key.data].get_userid()
+
+
                 # Clean NewClients entry
                 NewClients[key.data].closecon()
-                del NewClients[key.data]
+                NewClients.pop(key.data)
+
+                try:
+                  pw_entry = pwd.getpwuid(cuserid)
+                except KeyError:
+                  mlog.log('Cannot retrieve user data!')
+                  continue
 
                 # Create and register a pair of eventfd
                 evfds = (os.eventfd(0), os.eventfd(0))
                 os.set_blocking(evfds[0], False)
                 os.set_blocking(evfds[1], False)
-                evfd_ref = ('evfd____%04d' % ClientsNum).encode()
+                evfd_ref = ('evfd____%04d' % cuserid).encode()
                 data = evfd_ref
                 sel.register(evfds[0], selectors.EVENT_READ, data=data)
 
@@ -218,14 +273,19 @@ def launch_server():
                 thread_Queues = (queue.Queue(), queue.Queue())
 
                 # Register new thread
-                tname = 'th%04d' % ClientsNum
-                t = threading.Thread(target=client_manager, 
-                                     args=(tname, ans,
+                tname = cuserid
+                t = threading.Thread(target=client_manager,
+                                     args=(str(tname), ans,
                                            evfds, thread_Queues))
+
+                is_in_master_grp = False
+                if pw_entry.pw_name in WPAGFMASTER_MEMBERS:
+                  mlog.log('Client is in master membership.')
+                  is_in_master_grp = True
                 
                 CliMetaData = {'th': t,
                                'is_master': False,
-                               'is_in_master_grp': True,
+                               'is_in_master_grp': is_in_master_grp,
                                'evfd': evfds,
                                'evfd_ref': evfd_ref,
                                'Queue': thread_Queues}
@@ -264,27 +324,54 @@ def launch_server():
                 if qcli['action'] == 'BUSY':
                   mlog.log('WPACLI is busy...', lev=9)
                   wpa_cli_busy = True
+                  for k, c in CliMans.items():
+                    if c['is_master']:
+                      continue
+                    qdata = {'action': 'BUSY'}
+                    send_to_thread(c, qdata)
                 elif qcli['action'] == 'READY':
                   mlog.log('WPACLI is now ready!', lev=9)
                   wpa_cli_busy = False
+                  for k, c in CliMans.items():
+                    if c['is_master']:
+                      continue
+                    qdata = {'action': 'READY'}
+                    send_to_thread(c, qdata)
                 elif qcli['action'] == 'UPDATE_INET_STATUS':
                   mlog.log('STATUS change!', lev=8)
                   inet_status = qcli['data']
+                  for k, c in CliMans.items():
+                    if c['is_master']:
+                      continue
+                    qdata = {'action': 'UPDATE_INET_STATUS',
+                             'data': inet_status}
+                    send_to_thread(c, qdata)
                 elif qcli['action'] == 'SCANNING':
                   mlog.log('Scanning for Networks...', lev=8)
+                  for k, c in CliMans.items():
+                    if c['is_master']:
+                      continue
+                    qdata = {'action': 'SCANNING'}
+                    send_to_thread(c, qdata)
                 elif qcli['action'] == 'SCAN_RESULTS':
                   scan_results = qcli['data']
                   if len(scan_results['results']) == 0:
                     mlog.log('No networks found!')
                   else:
-                    mlog.log('Scan results:')
                     for k in scan_results['results']:
-                      slog = k + ' '
+                      slog = k + ' ~~ '
                       for f in scan_results['results'][k]:
                         slog += f + ' '
-                      mlog.log(' -> %s' % slog)
+                      mlog.log('Scan results: -> %s' % slog)
+                  for k, c in CliMans.items():
+                    if c['is_master']:
+                      continue
+                    qdata = {'action': 'SCAN_RESULTS',
+                             'data': scan_results}
+                    send_to_thread(c, qdata)
                 elif qcli['action'] == 'ASSOCIATING':
                   mlog.log('Associating...')
+
                 else:
                   mlog.log('Unknown action %s!' % qcli['action'])
 
@@ -292,7 +379,7 @@ def launch_server():
           # Handle event from thread
           elif key.data[0:8] == b'evfd____':
             # Get thread number
-            etname = 'th' + key.data[8:].decode()
+            etname = int(key.data[8:].decode())
             if etname in CliMans:
               dt = os.eventfd_read(CliMans[etname]['evfd'][0])
 
@@ -302,12 +389,57 @@ def launch_server():
                 CliMans[etname]['th'].join()
                 if CliMans[etname]['is_master']:
                   has_master = False
-                del CliMans[etname]
+                CliMans.pop(etname)
+
+                if has_master is False:
+                  # Promote new master if someone is in
+                  #  master group
+                  for k, c in CliMans.items():
+                    if c['is_in_master_grp']:
+                      qdata = {'action': 'SET_MASTER',
+                               'data':
+                                  {'cli_evfd': cli_master_fds,
+                                   'cli_queue': master_thread_Q}
+                              }
+                      send_to_thread(c, qdata)
+                      has_master = True
+                      c['is_master'] = True
+                      break
 
               else:
-                mlog.log('Message in queue from thread %s.' % \
+                mlog.log('New message in queue from thread %d.' % \
                          etname, lev=8)
-                qth = CliMans[etname]['Queue'][0].get()
+                c = CliMans[etname]
+                while not c['Queue'][0].empty():
+                  qth = c['Queue'][0].get()
+                  mlog.log('   Request: %s from %d' % (qth['action'], etname),
+                           lev=8)
+
+                  if qth['action'] == 'GET_STATUS':
+                    qdata = {'action': 'GOT_INET_STATUS',
+                             'data': inet_status}
+                    send_to_thread(c, qdata)
+
+                  if qth['action'] == 'SCAN':
+                    do_fresh_scan = False
+                    if 'scan_end' in scan_results:
+                      if type(scan_results['scan_end']) == int:
+                        if int((time.time_ns() - \
+                                scan_results['scan_end'])/1e9) > scan_min_interval:
+                          do_fresh_scan = True
+                      else:
+                        do_fresh_scan = True
+                    else:
+                      do_fresh_scan = True
+
+                    if do_fresh_scan:
+                      qdata = {'action': 'SCAN'}
+                      wpa_cli_Q[1].put_nowait(qdata)
+                      os.eventfd_write(clievfds[1], 0x10)
+                    else:
+                      qdata = {'action': 'SCAN_RESULTS',
+                               'data': scan_results}
+                      send_to_thread(c, qdata)
 
                 
 

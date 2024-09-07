@@ -321,11 +321,35 @@ class wpa_cli_manager:
       # If busy empty queue and send BUSY!
       if self.busy:
         self.log.log('I''m busy just now!')
-        while not self._qfrommaster.empty():
+        while not self._qfrommain.empty():
           qi = self._qfrommain.get()
         qans = {'action': 'BUSY'}
-        self._qtomain.put_nowait(qans)
-        os.eventfd_write(self.evfdw, 0x10)
+        self.send_to_main(qans)
+
+      # Handle request
+      while not self._qfrommain.empty():
+        qi = self._qfrommain.get()
+
+        if qi['action'] == 'SCAN':
+          self.scan_res['scan_started'] = time.time_ns()
+          self.scan_res['scan_end'] = None
+          self.scan_res['request_from'] = 'MAIN'
+          self.scan_res['results'] = None
+
+          self.target.set_name('SCAN', 'MAIN')
+          self.target.add_node('do_scan', 'SCAN',
+                               onsuccess='scanning')
+          self.target.add_node('scanning', 'SCANNING',
+                               onsuccess='get_scan_res',
+                               onsuccess_exec=('scan_result', ))
+          self.target.add_node('get_scan_res', 'GET_SCAN_RESULT',
+                               onsuccess='get_status',
+                               onsuccess_exec=('status', ))
+          self.target.add_node('get_status', 'PARSE_INET_STATUS',
+                               onsuccess='end')
+          self.target.add_node('end', 'IDLE')
+
+          self.run_target('SCAN', 'scan')
 
       return True
 
@@ -349,8 +373,7 @@ class wpa_cli_manager:
         while not self._qfrommaster.empty():
           qi = self._qfrommaster.get()
         qans = {'action': 'BUSY'}
-        self._qtomaster.put_nowait(qans)
-        os.eventfd_write(self.msevfdw, 0x10)
+        self.send_to_master(qans)
 
 
       while not self._qfrommaster.empty():
@@ -404,9 +427,9 @@ class wpa_cli_manager:
             for i in range(0,int(len(hpsk)/2)):
               spsk += chr(int(hpsk[2*i:2*i+2], base=16))
 
-            if not spsk.isalnum():
+            if not re.match('[\u0020-\u007E]{8,63}', spsk):
               self.log.log(' !!!!')
-              self.log.log(' !!!! Not Printable PSK! !!!!')
+              self.log.log(' !!!! Not Printable PSK or wrong length! !!!!')
               return True
 
             connect_attempt['net_details']['SPSK'] = '"' + spsk + '"'
@@ -785,7 +808,7 @@ class wpa_cli_manager:
 
       qreq = {'action': 'SCAN_RESULTS', 'data': self.scan_res}
 
-      if self.scan_res['request_from'] == 'MASTER':
+      if self.is_master_attached:
         self.send_to_master(qreq)
 
       self.send_to_main(qreq)
@@ -971,16 +994,17 @@ class wpa_cli_manager:
     if not (mask & selectors.EVENT_READ):
       return False
 
+    wout = ''
     while True:
-      wout = os.read(self.ipod, 1024)
+      wout += os.read(self.ipod, 1024)
 
       if wout == b'':
         break
 
-      lws = wout.decode().split('\n')
+    lws = wout.decode().split('\n')
 
-      for l in lws:
-        self.log.log(' (IP) %s' % l, lev=8)
+    for l in lws:
+      self.log.log(' (IP) %s' % l, lev=8)
 
     os.close(self.ipod)
     self.sel.unregister(self.ipod)
@@ -994,16 +1018,17 @@ class wpa_cli_manager:
     if not (mask & selectors.EVENT_READ):
       return False
 
+    wout = ''
     while True:
       wout = os.read(self.iped, 1024)
 
       if wout == b'':
         break
 
-      lws = wout.decode().split('\n')
+    lws = wout.decode().split('\n')
 
-      for l in lws:
-        self.log.log(' (IP ERR) %s' % l, lev=8)
+    for l in lws:
+      self.log.log(' (IP ERR) %s' % l, lev=8)
 
     os.close(self.iped)
     self.sel.unregister(self.iped)
